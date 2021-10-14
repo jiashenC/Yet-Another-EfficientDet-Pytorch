@@ -1,0 +1,267 @@
+import os
+import json
+
+from collections import defaultdict
+from itertools import combinations
+
+import util
+from profile_best import process as best_process
+
+
+def process(video_path, used_model, use_gt=False):
+    cls = util.cls
+    count = util.count
+    gap = util.gap
+
+    skip_res = {'class': [], 'score': []}
+
+    res = []
+    length = 0
+    for i in range(8):
+        with open(os.path.join(video_path, 'res-{:d}.json'.format(i))) as f:
+            out_dict = json.load(f)
+            res.append(out_dict)
+            length = len(out_dict)
+
+    gt = res[-1]
+
+    exec_map, exec_sample_map = {}, defaultdict(lambda: [])
+
+    exec_plan, exec_res = [], {}
+    exec_sample_plan = []
+
+    sample_time = 0
+
+    est_list = [util.Esti() for i in range(7)]
+
+    def generate_sample_idx(start, end, existing_sample):
+        span = (end - start) // util.chunk_sample
+        target_sample_idx = list(range(start, end, span))
+
+        existing_sample_list = []
+        for i in range(8):
+            for k in existing_sample[i]:
+                if start <= k < end and k not in existing_sample_list:
+                    existing_sample_list.append(k)
+
+        actual_sample_idx = []
+        if len(existing_sample_list) == 0:
+            actual_sample_idx = target_sample_idx
+        elif 0 < len(existing_sample_list) < util.chunk_sample:
+            actual_sample_idx += existing_sample_list
+            for k in existing_sample_list:
+                best_dis = -1
+                best_idx = -1
+                for idx in target_sample_idx:
+                    if abs(idx - k) > best_dis and idx not in existing_sample_list:
+                        best_idx = idx
+                        best_dis = abs(idx - k)
+                actual_sample_idx.append(best_idx)
+                target_sample_idx.remove(best_idx)
+                if len(actual_sample_idx) == util.chunk_sample:
+                    break
+        else:
+            for idx in target_sample_idx:
+                best_dis = 0xffffffff
+                best_idx = -1
+                for k in existing_sample_list:
+                    if abs(idx - k) < best_dis:
+                        best_idx = k
+                        best_dis = abs(idx - k)
+                actual_sample_idx.append(best_idx)
+                existing_sample_list.remove(best_idx)
+                if len(actual_sample_idx) == util.chunk_sample:
+                    break
+
+        return sorted(actual_sample_idx)
+
+    def traverse(depth, start, end):
+        nonlocal exec_plan, exec_sample_plan, exec_map, exec_sample_map, est_list
+
+        if depth == 1:
+            used_model = list(range(8))
+        else:
+            used_model = util.best_n(est_list, n=2) + [7]
+            used_model = sorted(used_model)
+
+        sample_idx = generate_sample_idx(start, end,
+                                         exec_sample_map)
+
+        # metrics = [([], []) for _ in range(8)]
+        accuracy_std = []
+        sample_plan = []
+        useful_sample = 0
+
+        for i in sample_idx:
+            best_plan = 7
+            for m in range(7, -1, -1):
+                if m not in used_model:
+                    continue
+                if i not in exec_sample_map[m]:
+                    exec_plan.append(m)
+                    exec_sample_plan.append(m)
+                    exec_sample_map[m].append(i)
+                if m != 7:
+                    reward = util.evaluate(cls, count, res[m][str(i)]) == util.evaluate(cls, count, gt[str(i)])
+                    est_list[m].update(reward)
+                # if util.evaluate(cls, count, gt[str(i)]):
+                #     if util.evaluate(cls, count, res[m][str(i)]):
+                #         metrics[m][0].append(1)
+                #         metrics[m][1].append(1)
+                #     else:
+                #         metrics[m][1].append(0)
+                # else:
+                #     if util.evaluate(cls, count, res[m][str(i)]):
+                #         metrics[m][0].append(0)
+                if util.evaluate(cls, count, res[m][str(i)]) == util.evaluate(cls, count, gt[str(i)]):
+                    best_plan = m
+                    accuracy_std.append(1)
+                else:
+                    for k in range(m, -1, -1):
+                        accuracy_std.append(0)
+                    break
+            sample_plan.append(best_plan)
+            if util.evaluate(cls, count, gt[str(i)]):
+                useful_sample += 1
+
+        # precision_std, recall_std = [], []
+        # sel_plan = 7
+        # for m in range(7, -1, -1):
+        #     if m not in used_model:
+        #         continue
+        #     pv = metrics[m][0]
+        #     if len(pv) == 0:
+        #         continue
+        #     precision_std.append(sum(pv) / len(pv))
+        #     rv = metrics[m][1]
+        #     if len(rv) == 0:
+        #         continue
+        #     recall_std.append(sum(rv) / len(rv))
+        #     if precision_std[-1] == recall_std[-1] == 1:
+        #         sel_plan = m
+
+        # if (util.sample_lower_bound(precision_std, len(used_model)) <= useful_sample and util.sample_lower_bound(recall_std, len(used_model)) <= useful_sample and useful_sample / util.chunk_sample > 0.7) or abs(end - start) < util.small_chunk:
+        if (util.sample_lower_bound(accuracy_std, len(used_model)) <= useful_sample and useful_sample / util.chunk_sample >= 0.7) or abs(end - start) < util.small_chunk:
+            sel_plan = max(sample_plan)
+            for k in range(start, end):
+                if k in exec_sample_map[7]:
+                    exec_map[k] = 7
+                elif k in exec_sample_map[sel_plan]:
+                    exec_map[k] = sel_plan
+                else:
+                    exec_plan.append(sel_plan)
+                    exec_map[k] = sel_plan
+        else:
+            span = (end - start) // 2
+            traverse(depth + 1, start, start + span)
+            traverse(depth + 1, start + span, end)
+
+    traverse(1, 0, length)
+
+    for i in range(length):
+        if exec_map[i] == -1:
+            exec_res[str(i)] = skip_res
+        else:
+            exec_res[str(i)] = res[exec_map[i]][str(i)]
+
+    assert len(exec_res) == length
+
+    if use_gt:
+        with open(os.path.join(video_path, 'gt.json')) as f:
+            gt = json.load(f)
+
+    exec_time = 0
+    for e in exec_plan:
+        if e == -1:
+            continue
+        exec_time += util.time_dict[e]
+
+    exec_sample_time = 0
+    for e in exec_sample_plan:
+        if e == -1:
+            continue
+        exec_sample_time += util.time_dict[e]
+
+    speedup = util.time_dict[-1] / (exec_time / length)
+
+    tp, p = 0, 0
+    for k in range(length):
+        if util.evaluate(cls, count, exec_res[str(k)]):
+            p += 1
+            if str(k) in gt and util.evaluate(
+                    cls, count, gt[str(k)], use_gt=use_gt):
+                tp += 1
+    precision = 0 if (p == 0) else tp / p
+
+    p = 0
+    for k in range(length):
+        if str(k) in gt and util.evaluate(
+                cls, count, gt[str(k)], use_gt=use_gt):
+            p += 1
+    recall = 0 if (p == 0) else tp / p
+
+    # model_str = '[' + ','.join([str(m) for m in used_model]) + ']'
+    print(
+        '|{path:^{w}}|{speedup:^{w}.2f}|{sampling_ratio:^{w}.2f}|{opt_time_ratio:^{w}.2f}|{precision:^{w}.2f}|{recall:^{w}.2f}|'
+        .format(path=video_path.split('/')[-1],
+                speedup=speedup,
+                sampling_ratio=sample_time / length * 100,
+                opt_time_ratio=exec_sample_time / exec_time * 100,
+                precision=precision * 100,
+                recall=recall * 100,
+                w=11))
+
+    return speedup, 2 / (
+        1 / precision + 1 / recall
+    ) if precision != 0 and recall != 0 else 0, sample_time / length * 100
+
+
+def main():
+    res = []
+    open('dynamic.log', 'w').close()
+
+    gap = util.gap
+
+    use_gt = util.use_gt
+
+    tmp_working = []
+
+    base_dir = '/data/jiashenc/ua_detrac/test/'
+    # base_dir = '/data/jiashenc/virat/'
+    for video_path in os.listdir(base_dir):
+
+        # if len(
+        #         tmp_working
+        # ) != 0 and video_path not in tmp_working or 'VIRAT' not in video_path:
+        #     continue
+
+        skip = False
+        for l in range(8):
+            if not os.path.isfile(
+                    os.path.join(base_dir, video_path,
+                                 'res-{}.json'.format(l))):
+                skip = True
+        if skip:
+            continue
+
+        with open(os.path.join(base_dir, video_path, 'res-7.json')) as f:
+            tmp_res = json.load(f)
+            length = len(tmp_res)
+
+        best_acc = best_process(os.path.join(base_dir, video_path),
+                                use_gt=use_gt)
+
+        if best_acc > 0.1:
+            res += [
+                process(os.path.join(base_dir, video_path),
+                        [_ for _ in range(8)],
+                        use_gt=use_gt)
+            ]
+
+        print('-' * 73)
+
+    # process('/data/jiashenc/jackson/0/', [_ for _ in range(8)], use_gt=use_gt)
+
+
+if __name__ == '__main__':
+    main()
